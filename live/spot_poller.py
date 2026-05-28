@@ -4,17 +4,15 @@ spot_poller.py — Periodic REST poll for the SPY spot price.
 Pulls the latest quote snapshot from the Theta Terminal's local HTTP server
 and updates shared_state.spot_price every SPOT_POLL_INTERVAL seconds.
 
-DESIGN NOTE:
-    This module is intentionally isolated.  Once the ATM-proxy approach is
-    implemented in the worker layer, this file can be removed or disabled by
-    setting SPOT_POLL_INTERVAL to 0 in config.py.  The rest of the system
-    only reads shared_state.spot_price — it does not care how it got there.
+ThetaData REST response format (columnar):
+    {
+      "header": {"response": ["ms_of_day", "bid_size", "bid", "ask_size", "ask", ...]},
+      "response": [[<ms>, <bid_size>, <bid>, <ask_size>, <ask>, ...]]
+    }
 
-FREE TIER CAVEAT:
-    ThetaData's free stocks tier returns quotes with up to 15-minute delay.
-    Given the project's ≤5 s latency tolerance, this is acceptable only
-    during testing / development.  On Standard stocks, data is real-time.
-    Replace the REST URL or switch to the ATM proxy when accuracy matters.
+Note: "header" is a dict with a "response" key containing the column name list.
+      "response" is a list of rows, each row is a list of values.
+      We zip the column names with the row values to build a usable dict.
 """
 
 import asyncio
@@ -35,7 +33,7 @@ async def poll_spot() -> None:
     Uses a single persistent aiohttp ClientSession for connection reuse.
     Each poll:
         1. GET /v2/snapshot/stock/quote?root=SPY
-        2. Parse bid + ask from the response
+        2. Parse bid + ask from the columnar response
         3. Compute mid = (bid + ask) / 2
         4. Write to shared_state.spot_price
 
@@ -65,7 +63,7 @@ async def poll_spot() -> None:
                         else:
                             log.warning(
                                 "Could not extract valid mid from snapshot: %s",
-                                str(data)[:200],
+                                str(data)[:300],
                             )
 
             except asyncio.TimeoutError:
@@ -78,7 +76,6 @@ async def poll_spot() -> None:
             except Exception as exc:
                 log.exception("Unexpected error in poll_spot: %s", exc)
 
-            # ── Wait for next poll ──────────────────────────────────────────
             try:
                 await asyncio.sleep(config.SPOT_POLL_INTERVAL)
             except asyncio.CancelledError:
@@ -87,35 +84,60 @@ async def poll_spot() -> None:
 
 def _extract_mid(data: dict) -> float | None:
     """
-    Extract the mid-price from ThetaData's snapshot response.
+    Extract the mid-price from ThetaData's columnar REST snapshot response.
 
-    ThetaData REST snapshot format (Standard/Free):
+    ThetaData REST format:
     {
-      "header": {"status": "OK"},
-      "response": [
-        {"bid": 559.80, "ask": 559.82, ...}
-      ]
+      "header": {"response": ["ms_of_day", "bid_size", "bid", "ask_size", "ask", ...]},
+      "response": [[<ms>, <bid_sz>, <bid>, <ask_sz>, <ask>, ...], ...]
     }
 
-    Falls back gracefully if the format differs (e.g. a "last" field only).
-    Returns None if no usable price can be found.
+    Steps:
+      1. Extract column names from header["response"]
+      2. Take the first data row from response[0]
+      3. Zip into a dict
+      4. Return (bid + ask) / 2, or fall back to "last" / "price" if available
+
+    Returns None if no usable price can be found, so the caller leaves
+    shared_state.spot_price unchanged.
     """
     try:
-        response = data.get("response", [])
-        if not response:
+        # ── Column names ────────────────────────────────────────────────────
+        header  = data.get("header", {})
+        columns = header.get("response", [])   # list of column name strings
+
+        # ── Data rows ───────────────────────────────────────────────────────
+        rows = data.get("response", [])
+        if not rows:
+            log.debug("_extract_mid: empty response list. raw=%.300s", str(data))
             return None
 
-        quote = response[0]
+        row = rows[0]
+
+        # ── Build a dict from column names + row values ──────────────────────
+        if columns and isinstance(row, (list, tuple)):
+            quote = dict(zip(columns, row))
+        elif isinstance(row, dict):
+            # Defensive: handle hypothetical future dict-per-row format
+            quote = row
+        else:
+            log.warning(
+                "_extract_mid: unrecognised row type %s. row=%.200s",
+                type(row), str(row),
+            )
+            return None
+
+        # ── Extract bid / ask ────────────────────────────────────────────────
         bid = quote.get("bid")
         ask = quote.get("ask")
 
         if bid is not None and ask is not None:
             b, a = float(bid), float(ask)
-            # Sanity: reject crossed/zero quotes
+            # Reject crossed / zero quotes
             if a > b > 0:
                 return (b + a) / 2.0
 
-        # Fallback: use last trade price if bid/ask unavailable
+        # ── Fallback: last trade price ───────────────────────────────────────
         last = quote.get("last") or quote.get("price")
         if last is not None:
             v = float(last)
@@ -123,7 +145,9 @@ def _extract_mid(data: dict) -> float | None:
                 log.debug("Using last trade price as spot proxy: %.2f", v)
                 return v
 
+        log.debug("_extract_mid: no usable price field in quote dict: %s", quote)
+
     except (TypeError, ValueError, IndexError) as exc:
-        log.debug("_extract_mid parse error: %s | data=%.200s", exc, str(data))
+        log.debug("_extract_mid parse error: %s | data=%.300s", exc, str(data))
 
     return None
