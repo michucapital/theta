@@ -19,6 +19,14 @@ import logging
 import time
 from typing import Optional
 
+# orjson is 3-5x faster than stdlib json on typical FPSS payloads.
+# Fall back to stdlib transparently if the package is not installed.
+try:
+    import orjson
+    _loads = orjson.loads
+except ImportError:
+    _loads = json.loads  # type: ignore[assignment]
+
 import websockets
 from websockets.exceptions import (
     ConnectionClosed,
@@ -40,6 +48,8 @@ log = logging.getLogger("connection")
 _sub_id: int = 0
 
 # Timestamp of the last received STATUS heartbeat (monotonic clock).
+# Written in _run_session BEFORE the watchdog task is created so the
+# watchdog never sees a stale timestamp on a fresh connection.
 _last_heartbeat: float = 0.0
 
 
@@ -99,10 +109,6 @@ def _parse_tick(msg: dict) -> Optional[OptionTick]:
 
 # ── Heartbeat watchdog ────────────────────────────────────────────────────────
 
-class _HeartbeatDead(Exception):
-    """Raised by the watchdog to signal a stale connection."""
-
-
 async def _heartbeat_watchdog(ws) -> None:
     """
     Runs concurrently with the read loop.
@@ -136,7 +142,9 @@ async def _run_session(ws) -> None:
     await ws.send(sub_msg)
     log.info("Subscription sent (id=%d): %s", sub_id, sub_msg)
 
-    # Seed the heartbeat clock so the watchdog doesn't immediately fire.
+    # Seed the heartbeat clock BEFORE creating the watchdog task.
+    # This prevents a false timeout if the event loop yields between
+    # create_task() and the first STATUS message arriving.
     _last_heartbeat = time.monotonic()
 
     watchdog_task = asyncio.create_task(
@@ -144,30 +152,42 @@ async def _run_session(ws) -> None:
         name="heartbeat_watchdog",
     )
 
+    # Counters for burst-drop logging (Opt 2).
+    # We log once when a drop episode starts and once when it ends,
+    # rather than emitting a warning on every single dropped tick.
+    _in_drop_episode: bool = False
+    _drop_count: int = 0
+
     try:
         async for raw in ws:
             # ── Parse ────────────────────────────────────────────────────────
             if not isinstance(raw, str):
-                # Binary frames should never arrive; log and skip.
                 log.debug("Unexpected binary frame (%d bytes), skipping.", len(raw))
                 continue
 
             try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError as exc:
+                msg = _loads(raw)
+            except (ValueError, Exception) as exc:
                 log.warning("JSON decode error: %s | raw snippet: %.120s", exc, raw)
                 continue
 
-            header = msg.get("header", {})
+            header   = msg.get("header", {})
             msg_type = header.get("type", "")
 
             # ── STATUS heartbeat ─────────────────────────────────────────────
             if msg_type == "STATUS":
                 _last_heartbeat = time.monotonic()
+                # End of drop episode if one was active.
+                if _in_drop_episode:
+                    log.warning(
+                        "Queue drop episode ended — %d tick(s) discarded.",
+                        _drop_count,
+                    )
+                    _in_drop_episode = False
+                    _drop_count = 0
                 continue
 
             # ── Subscription confirmation ────────────────────────────────────
-            # Confirmation frames carry the header type + our id but no contract.
             if msg_type == "TRADE" and "contract" not in msg:
                 status = header.get("status", "?")
                 log.info("Subscription confirmed (id=%d, status=%s).", sub_id, status)
@@ -177,24 +197,47 @@ async def _run_session(ws) -> None:
             if msg_type == "TRADE":
                 tick = _parse_tick(msg)
                 if tick is None:
-                    continue  # wrong root or malformed — already logged at DEBUG
+                    continue
 
                 try:
                     shared_state.tick_queue.put_nowait(tick)
+                    # Queue accepted the tick: end drop episode if one was active.
+                    if _in_drop_episode:
+                        log.warning(
+                            "Queue drop episode ended — %d tick(s) discarded.",
+                            _drop_count,
+                        )
+                        _in_drop_episode = False
+                        _drop_count = 0
                 except asyncio.QueueFull:
-                    # Consumer is lagging.  Drop oldest tick to make room.
+                    # Drop the oldest tick to make room for the incoming one.
                     try:
                         shared_state.tick_queue.get_nowait()
                     except asyncio.QueueEmpty:
                         pass
-                    shared_state.tick_queue.put_nowait(tick)
-                    log.warning("Tick queue full — oldest tick dropped to prevent backpressure.")
+                    try:
+                        shared_state.tick_queue.put_nowait(tick)
+                    except asyncio.QueueFull:
+                        pass  # extremely unlikely: another coroutine filled it
+                    _drop_count += 1
+                    if not _in_drop_episode:
+                        log.warning(
+                            "Tick queue full — dropping oldest ticks. "
+                            "Consumer may be lagging."
+                        )
+                        _in_drop_episode = True
                 continue
 
             # ── Unknown frame type ───────────────────────────────────────────
             log.debug("Unhandled frame type '%s': %.200s", msg_type, raw)
 
     finally:
+        # Log any unresolved drop episode before tearing down.
+        if _in_drop_episode:
+            log.warning(
+                "Queue drop episode ended at session close — %d tick(s) discarded.",
+                _drop_count,
+            )
         watchdog_task.cancel()
         try:
             await watchdog_task
@@ -220,13 +263,12 @@ async def connect_and_stream() -> None:
         log.info("Connection attempt #%d to %s", attempt, config.WS_URL)
 
         try:
-            # open_timeout: abort if the handshake takes longer than 10 s.
             async with websockets.connect(
                 config.WS_URL,
                 open_timeout=10,
                 close_timeout=5,
-                ping_interval=None,   # We rely on the ThetaData STATUS heartbeat;
-                ping_timeout=None,    # disable the websockets library's own pings.
+                ping_interval=None,   # ThetaData STATUS heartbeat is our keepalive;
+                ping_timeout=None,    # disable the library's own pings.
                 max_size=2**23,       # 8 MB — generous for burst frames.
             ) as ws:
                 log.info("WebSocket connected.")

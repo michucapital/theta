@@ -15,7 +15,7 @@ What it does NOT do yet (added in later steps):
 
 Usage:
     cd live/
-    pip install websockets aiohttp
+    pip install websockets aiohttp orjson
     python main.py
 
 Press Ctrl+C to stop cleanly.
@@ -50,26 +50,51 @@ async def consume_ticks() -> None:
     THIS IS A TEMPORARY STUB.  In the next step this function is replaced
     by the filter + indicator worker.  The interface (asyncio.Queue of
     OptionTick) is the permanent contract between this layer and the next.
+
+    Uses shutdown_event instead of asyncio.wait_for(..., timeout=1.0) to avoid
+    allocating a new Future object on every iteration of the hot loop.
     """
     ticks_received = 0
-    log_every = 500   # print a summary line every N ticks to avoid console flood
+    log_every = 500
+
+    # get_task wraps queue.get() so we can cancel it cleanly when shutdown fires.
+    get_task: asyncio.Task | None = None
 
     while not shared_state.shutdown:
-        try:
-            tick: shared_state.OptionTick = await asyncio.wait_for(
-                shared_state.tick_queue.get(),
-                timeout=1.0,   # allows checking shutdown flag
-            )
-        except asyncio.TimeoutError:
-            continue
-        except asyncio.CancelledError:
+        # Create one get_task and await it alongside the shutdown event.
+        # If shutdown fires first, cancel the pending get and exit.
+        get_task = asyncio.ensure_future(shared_state.tick_queue.get())
+        done, _ = await asyncio.wait(
+            {get_task, asyncio.ensure_future(shared_state.shutdown_event.wait())},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        if shared_state.shutdown_event.is_set():
+            # Cancel the in-flight get if it hasn't resolved yet.
+            if not get_task.done():
+                get_task.cancel()
+                try:
+                    await get_task
+                except (asyncio.CancelledError, Exception):
+                    pass
             return
 
-        ticks_received += 1
-        shared_state.tick_queue.task_done()
+        # get_task completed — retrieve the tick safely.
+        tick: shared_state.OptionTick
+        try:
+            tick = get_task.result()
+        except Exception as exc:
+            log.error("Unexpected error retrieving tick from queue: %s", exc)
+            continue
+        finally:
+            # task_done() must always be called after a successful get(),
+            # even if an exception occurs before we process the tick.
+            # This keeps the queue's internal join-counter consistent for
+            # any future caller of queue.join().
+            shared_state.tick_queue.task_done()
 
-        # Print every tick when volume is low (first 200 ticks at startup).
-        # After that, print a summary line every `log_every` ticks.
+        ticks_received += 1
+
         if ticks_received <= 200 or ticks_received % log_every == 0:
             log.info(
                 "TICK #%6d | %s %s $%7.2f exp=%d | px=%.2f sz=%d cond=%d | spot=%.2f",
@@ -90,14 +115,16 @@ async def consume_ticks() -> None:
 def _handle_signal(signame: str) -> None:
     log.info("Received %s — initiating graceful shutdown …", signame)
     shared_state.shutdown = True
+    shared_state.shutdown_event.set()  # wake any coroutine blocked on queue.get()
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 async def main() -> None:
-    # Initialise the shared queue now (must be created inside an async context
-    # so it binds to the running event loop).
-    shared_state.tick_queue = asyncio.Queue(maxsize=config.QUEUE_MAXSIZE)
+    # Both must be created inside an async context so they bind to the
+    # running event loop.
+    shared_state.tick_queue    = asyncio.Queue(maxsize=config.QUEUE_MAXSIZE)
+    shared_state.shutdown_event = asyncio.Event()
 
     # Register OS signal handlers for clean Ctrl+C / SIGTERM.
     loop = asyncio.get_running_loop()
@@ -115,28 +142,38 @@ async def main() -> None:
     log.info("  Queue max : %d ticks", config.QUEUE_MAXSIZE)
     log.info("=" * 60)
 
-    # Launch all three coroutines as concurrent Tasks.
     stream_task  = asyncio.create_task(connect_and_stream(), name="stream")
     poller_task  = asyncio.create_task(poll_spot(),          name="spot_poller")
     consume_task = asyncio.create_task(consume_ticks(),      name="consumer")
 
     all_tasks = [stream_task, poller_task, consume_task]
 
-    # Wait until the shutdown flag is set (via signal handler).
+    # Supervise: wake every 250ms to check flags and task health.
     while not shared_state.shutdown:
-        # Wake up periodically to re-check the flag.
         await asyncio.sleep(0.25)
 
-        # If any task died with an unhandled exception, propagate it here.
         for task in all_tasks:
-            if task.done() and not task.cancelled():
-                exc = task.exception()
-                if exc is not None:
-                    log.error("Task '%s' raised: %s", task.get_name(), exc)
-                    shared_state.shutdown = True
+            if not task.done():
+                continue
+            if task.cancelled():
+                continue
+            # Task finished (normally or with an exception).
+            exc = None
+            try:
+                exc = task.exception()  # raises InvalidStateError if cancelled,
+            except asyncio.CancelledError:  # but we already guarded above.
+                continue
+            if exc is not None:
+                log.error(
+                    "Task '%s' raised an unhandled exception: %s — shutting down.",
+                    task.get_name(), exc,
+                )
+                shared_state.shutdown = True
+                shared_state.shutdown_event.set()
 
     # ── Teardown ──────────────────────────────────────────────────────────────
     log.info("Shutting down tasks …")
+    shared_state.shutdown_event.set()  # ensure set even if signal handler wasn't called
     for task in all_tasks:
         task.cancel()
 
