@@ -4,15 +4,20 @@ spot_poller.py — Periodic REST poll for the SPY spot price.
 Pulls the latest quote snapshot from the Theta Terminal's local HTTP server
 and updates shared_state.spot_price every SPOT_POLL_INTERVAL seconds.
 
-ThetaData REST response format (columnar):
+ThetaData REST response format (columnar, confirmed from live logs):
     {
-      "header": {"response": ["ms_of_day", "bid_size", "bid", "ask_size", "ask", ...]},
-      "response": [[<ms>, <bid_size>, <bid>, <ask_size>, <ask>, ...]]
+      "header": {
+        "format": ["ms_of_day", "bid_size", "bid_exchange", "bid",
+                   "bid_condition", "ask_size", "ask_exchange", "ask",
+                   "ask_condition", "date"],
+        "latency_ms": 126,
+        "next_page": "null"
+      },
+      "response": [[72000475, 480, 7, 749.94, 0, 480, 7, 750.06, 0, 20260527]]
     }
 
-Note: "header" is a dict with a "response" key containing the column name list.
-      "response" is a list of rows, each row is a list of values.
-      We zip the column names with the row values to build a usable dict.
+Column names live in header["format"].  Each row in "response" is a plain
+list of values.  We zip them to build a usable dict per row.
 """
 
 import asyncio
@@ -40,8 +45,8 @@ async def poll_spot() -> None:
     Failures (network, parse) are logged at WARNING and the previous
     spot_price value is left unchanged — the stream keeps running.
     """
-    url    = config.REST_BASE + config.SPOT_SNAPSHOT_PATH
-    params = {"root": config.SPOT_ROOT}
+    url     = config.REST_BASE + config.SPOT_SNAPSHOT_PATH
+    params  = {"root": config.SPOT_ROOT}
     timeout = aiohttp.ClientTimeout(total=config.SPOT_HTTP_TIMEOUT)
 
     log.info("Spot poller starting — polling %s every %.1fs.", url, config.SPOT_POLL_INTERVAL)
@@ -57,8 +62,10 @@ async def poll_spot() -> None:
                         )
                     else:
                         data = await resp.json(content_type=None)
-                        mid = _extract_mid(data)
+                        mid  = _extract_mid(data)
                         if mid is not None and mid > 0.0:
+                            if shared_state.spot_price == config.SPOT_INITIAL:
+                                log.info("Spot price initialised: %.2f", mid)
                             shared_state.spot_price = mid
                         else:
                             log.warning(
@@ -86,39 +93,35 @@ def _extract_mid(data: dict) -> float | None:
     """
     Extract the mid-price from ThetaData's columnar REST snapshot response.
 
-    ThetaData REST format:
-    {
-      "header": {"response": ["ms_of_day", "bid_size", "bid", "ask_size", "ask", ...]},
-      "response": [[<ms>, <bid_sz>, <bid>, <ask_sz>, <ask>, ...], ...]
-    }
+    Confirmed live format:
+      header["format"] — list of column name strings
+      response         — list of rows, each row is a list of values
 
     Steps:
-      1. Extract column names from header["response"]
+      1. Read column names from header["format"]
       2. Take the first data row from response[0]
-      3. Zip into a dict
-      4. Return (bid + ask) / 2, or fall back to "last" / "price" if available
+      3. Zip into a dict keyed by column name
+      4. Return (bid + ask) / 2
 
-    Returns None if no usable price can be found, so the caller leaves
-    shared_state.spot_price unchanged.
+    Returns None if no usable price can be found, leaving
+    shared_state.spot_price unchanged in the caller.
     """
     try:
-        # ── Column names ────────────────────────────────────────────────────
         header  = data.get("header", {})
-        columns = header.get("response", [])   # list of column name strings
+        columns = header.get("format", [])      # ← confirmed key from live logs
 
-        # ── Data rows ───────────────────────────────────────────────────────
         rows = data.get("response", [])
         if not rows:
-            log.debug("_extract_mid: empty response list. raw=%.300s", str(data))
+            log.debug("_extract_mid: empty response list.")
             return None
 
         row = rows[0]
 
-        # ── Build a dict from column names + row values ──────────────────────
+        # Build a dict from column names + row values.
         if columns and isinstance(row, (list, tuple)):
             quote = dict(zip(columns, row))
         elif isinstance(row, dict):
-            # Defensive: handle hypothetical future dict-per-row format
+            # Defensive: handle a hypothetical future dict-per-row format.
             quote = row
         else:
             log.warning(
@@ -127,13 +130,12 @@ def _extract_mid(data: dict) -> float | None:
             )
             return None
 
-        # ── Extract bid / ask ────────────────────────────────────────────────
+        # ── Primary: bid/ask mid ─────────────────────────────────────────────
         bid = quote.get("bid")
         ask = quote.get("ask")
 
         if bid is not None and ask is not None:
             b, a = float(bid), float(ask)
-            # Reject crossed / zero quotes
             if a > b > 0:
                 return (b + a) / 2.0
 
